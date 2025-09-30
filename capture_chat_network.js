@@ -23,39 +23,197 @@ async function run(targetUrl) {
   // Create CDP session to capture low-level network events (including websockets)
   const client = await context.newCDPSession(page);
   await client.send('Network.enable');
+  await client.send('Fetch.enable');
 
   // Storage for captured items
-  const requests = []; // {requestId, url, method, timestamp}
-  const responses = []; // {requestId, url, status, mimeType, body}
+  const requests = []; // {requestId, url, method, timestamp, postData}
+  const responses = []; // {requestId, url, status, mimeType, body, isStreaming, isComplete}
   const wsFrames = []; // {requestId, timestamp, opcode, payload}
+  const streamingResponses = []; // {requestId, url, method, postData, responseData, isComplete}
 
-  // Network.requestWillBeSent
+  // Network.requestWillBeSent - only capture POST requests
   client.on('Network.requestWillBeSent', (params) => {
     try {
       const { requestId, request, timestamp } = params;
-      requests.push({ requestId, url: request.url, method: request.method, timestamp });
+      // Only capture POST requests for streaming analysis
+      if (request.method === 'POST') {
+        const postData = request.postData;
+        requests.push({ requestId, url: request.url, method: request.method, timestamp, postData, headers: request.headers });
+      }
     } catch (e) { /* ignore */ }
   });
 
-  // Network.responseReceived -> attempt to get body
+  // Network.responseReceived -> attempt to get body (only for POST requests)
   client.on('Network.responseReceived', async (params) => {
     try {
       const { requestId, response } = params;
+      
+      // Only process responses for POST requests we captured
+      const matchingRequest = requests.find(r => r.requestId === requestId);
+      if (!matchingRequest) return;
+      
       const url = response.url;
       const mimeType = response.mimeType || '';
       const status = response.status;
-      // Only attempt to get body for likely JSON/text responses (avoid large images)
-      if (mimeType.includes('json') || mimeType.includes('text') || url.match(/\.(php|api|graphql|json)$/i) || /api|model|chat|complete|generate|response/i.test(url)) {
-        let body = null;
-        try {
-          const rb = await client.send('Network.getResponseBody', { requestId });
-          body = rb && rb.body ? rb.body : null;
-        } catch (err) {
-          body = `<<could not get body: ${err.message}>>`;
+      const headers = response.headers || {};
+      
+      // Check if this is a streaming response
+      const isStreaming = 
+        mimeType.includes('event-stream') || 
+        headers['content-type']?.includes('event-stream') ||
+        headers['transfer-encoding']?.includes('chunked');
+      
+      let body = null;
+      let isComplete = true;
+      let hasStreamingPackets = false;
+      
+      // Store response info without body for now
+      responses.push({ requestId, url, status, mimeType, body: null, isStreaming, isComplete, hasStreamingPackets });
+      
+      // Mark as streaming based on headers/mime type for now
+      if (isStreaming) {
+        streamingResponses.push({
+          requestId,
+          url,
+          method: matchingRequest.method,
+          postData: matchingRequest.postData,
+          headers: matchingRequest.headers,
+          responseHeaders: headers,
+          isComplete: false,
+          hasStreamingPackets: true,
+          body: null
+        });
+      }
+      
+      responses.push({ requestId, url, status, mimeType, body, isStreaming, isComplete, hasStreamingPackets });
+      
+      // If it appears to be streaming or has streaming packets, track it
+      if (isStreaming || hasStreamingPackets) {
+        streamingResponses.push({
+          requestId,
+          url,
+          method: matchingRequest.method,
+          postData: matchingRequest.postData,
+          headers: matchingRequest.headers,
+          responseHeaders: headers,
+          isComplete,
+          hasStreamingPackets,
+          body: body
+        });
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  // Network.loadingFinished -> get final response body when loading is complete
+  client.on('Network.loadingFinished', async (params) => {
+    try {
+      const { requestId } = params;
+      
+      // Find the corresponding response and request
+      const response = responses.find(r => r.requestId === requestId);
+      const request = requests.find(r => r.requestId === requestId);
+      
+      if (!response || !request) return; // Only process POST requests we're tracking
+      
+      // Try to get the response body now that loading is finished
+      try {
+        const rb = await client.send('Network.getResponseBody', { requestId });
+        let body = rb && rb.body ? rb.body : null;
+        
+        // Handle base64 encoded responses
+        if (rb && rb.base64Encoded && body) {
+          body = Buffer.from(body, 'base64').toString('utf-8');
         }
-        responses.push({ requestId, url, status, mimeType, body });
-      } else {
-        responses.push({ requestId, url, status, mimeType, body: null });
+        
+        // Update the response with the body
+        response.body = body;
+        response.isComplete = true;
+        
+        // Check for streaming patterns in the response body
+        if (body && typeof body === 'string') {
+          const hasStreamingPackets = 
+            body.includes('data: ') || 
+            body.includes('data:{') || 
+            body.includes('data:[') ||
+            /event:\s*data/i.test(body) ||
+            /delta:\s*"/i.test(body) ||
+            /content:\s*"/i.test(body) ||
+            /chunk/i.test(body) ||
+            /token/i.test(body) ||
+            /progress/i.test(body) ||
+            /finish_reason/i.test(body) ||
+            // New streaming format patterns
+            body.includes('f:{') ||  // Frame/start messages
+            body.includes('0:"') ||   // Content chunks
+            body.includes('e:{') ||  // End messages with finishReason
+            body.includes('d:{') ||  // Duplicate end messages
+            body.includes('"messageId":') || // Message ID indicators
+            /^f:\{/m.test(body) ||  // Frame/start messages (regex)
+            /^0:"/m.test(body) ||   // Content chunks (regex)
+            /^e:\{/m.test(body) ||  // End messages with finishReason (regex)
+            /^d:\{/m.test(body);    // Duplicate end messages (regex)
+            
+          response.hasStreamingPackets = hasStreamingPackets;
+          
+          // If we detected streaming patterns, add to streamingResponses if not already there
+          if (hasStreamingPackets) {
+            const existingStreaming = streamingResponses.find(sr => sr.requestId === requestId);
+            if (!existingStreaming) {
+              streamingResponses.push({
+                requestId,
+                url: response.url,
+                method: request.method,
+                postData: request.postData,
+                headers: request.headers,
+                responseHeaders: response.headers || {},
+                isComplete: true,
+                hasStreamingPackets: true,
+                body: body
+              });
+            } else {
+              // Update existing entry with complete body
+              existingStreaming.body = body;
+              existingStreaming.isComplete = true;
+            }
+          }
+        }
+      } catch (err) {
+        // Still couldn't get body - mark as error
+        response.body = `<<could not get response body: ${err.message}>>`;
+        response.isComplete = false;
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  // Network.dataReceived -> capture streaming data as it arrives
+  client.on('Network.dataReceived', async (params) => {
+    try {
+      const { requestId, dataLength, encodedDataLength } = params;
+      
+      // Find if this is a POST request we're tracking
+      const request = requests.find(r => r.requestId === requestId);
+      if (!request) return;
+      
+      // If we're receiving data chunks, it's likely streaming
+      const response = responses.find(r => r.requestId === requestId);
+      if (response) {
+        response.hasStreamingPackets = true;
+        
+        // Add to streaming responses if not already there
+        const existingStreaming = streamingResponses.find(sr => sr.requestId === requestId);
+        if (!existingStreaming) {
+          streamingResponses.push({
+            requestId,
+            url: response.url,
+            method: request.method,
+            postData: request.postData,
+            headers: request.headers,
+            responseHeaders: response.headers || {},
+            isComplete: false,
+            hasStreamingPackets: true,
+            body: `<<streaming data detected: ${dataLength} bytes received>>`
+          });
+        }
       }
     } catch (e) { /* ignore */ }
   });
@@ -65,10 +223,95 @@ async function run(targetUrl) {
     try {
       const { requestId, timestamp, response } = params;
       wsFrames.push({ requestId, timestamp, opcode: response.opcode, payload: response.payloadData });
+      
+      // If the payload includes streaming patterns
+      if (response.payloadData && typeof response.payloadData === 'string') {
+        const payloadStr = response.payloadData;
+        if (payloadStr.includes('data:') || 
+            payloadStr.includes('content:') || 
+            payloadStr.includes('delta:') || 
+            /chunk|stream|token|progress/i.test(payloadStr) ||
+            // New streaming format patterns
+            /^f:\{/m.test(payloadStr) ||
+            /^0:"/m.test(payloadStr) ||
+            /^e:\{/m.test(payloadStr) ||
+            /^d:\{/m.test(payloadStr) ||
+            /"messageId":/i.test(payloadStr)) {
+          // Check if this WebSocket is related to a POST request we captured
+          const matchingRequest = requests.find(r => r.requestId === requestId);
+          if (matchingRequest && !streamingResponses.some(sr => sr.requestId === requestId)) {
+            streamingResponses.push({
+              requestId,
+              url: 'websocket-connection',
+              method: 'WS',
+              postData: null, // WebSocket doesn't have traditional POST data
+              isWebsocket: true,
+              samplePayload: payloadStr.substring(0, 200),
+              hasStreamingPackets: true,
+              isComplete: false // WebSocket streams are ongoing
+            });
+          }
+        }
+      }
     } catch (e) { /* ignore */ }
   });
+  
   client.on('Network.webSocketFrameSent', (params) => {
-    // optional: capture outgoing frames
+    try {
+      // Capture outgoing frames to find input messages
+      const { requestId, timestamp, response } = params;
+      const payload = response && response.payloadData;
+      if (payload && typeof payload === 'string') {
+        // If it looks like a chat message/prompt being sent
+        if (payload.includes('"message"') || 
+            payload.includes('"prompt"') || 
+            payload.includes('"query"') || 
+            payload.includes('"input"')) {
+          // Update any existing streaming response for this WebSocket
+          const streamingResponse = streamingResponses.find(sr => sr.requestId === requestId);
+          if (streamingResponse) {
+            streamingResponse.postData = payload;
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+  });
+  
+  // Add Fetch API handling for better streaming detection (only for POST requests)
+  client.on('Fetch.requestPaused', async (params) => {
+    const { requestId, request, responseStatusCode, responseHeaders } = params;
+    try {
+      // Only process POST requests
+      if (request.method !== 'POST') {
+        await client.send('Fetch.continueRequest', { requestId });
+        return;
+      }
+      
+      // Continue the request normally
+      await client.send('Fetch.continueRequest', { requestId });
+      
+      // Check if this is likely a streaming response
+      if (responseHeaders) {
+        const contentType = responseHeaders.find(h => h.name.toLowerCase() === 'content-type')?.value || '';
+        const transferEncoding = responseHeaders.find(h => h.name.toLowerCase() === 'transfer-encoding')?.value || '';
+        
+        if (contentType.includes('event-stream') || transferEncoding.includes('chunked')) {
+          const matchingRequest = requests.find(r => r.url === request.url && r.method === 'POST');
+          if (matchingRequest && !streamingResponses.some(sr => sr.url === request.url)) {
+            streamingResponses.push({
+              requestId,
+              url: request.url,
+              method: request.method,
+              postData: request.postData,
+              headers: request.headers,
+              isFetchStream: true,
+              hasStreamingPackets: true,
+              isComplete: false // Fetch streams may be ongoing
+            });
+          }
+        }
+      }
+    } catch (e) { /* ignore - continue request already sent by other handler */ }
   });
 
   // Navigate
@@ -156,65 +399,167 @@ async function run(targetUrl) {
   console.log(`Capturing network events for ${captureWindowMs}ms after send...`);
   await page.waitForTimeout(captureWindowMs);
 
-  // Post-processing: find candidate response(s) that happened after send
-  // Use timestamps from requests array (CDP timestamps are seconds since epoch)
-  // We'll conservatively look at responses array and wsFrames.
-  console.log('\n--- Candidate HTTP responses captured (filtered) ---');
-  const interesting = responses.filter(r => {
-    // prefer responses with bodies and json/text mime or API-like URLs
-    return r.body && r.body.length > 0 && /json|text|event-stream|application\/json|api|chat|complete|generate/i.test(r.url + r.mimeType);
+  // Post-processing: focus only on POST requests with streaming responses
+  // All analysis is done in the final output section below
+
+  // Post-processing: show all POST request responses
+  console.log('\n=== ALL POST REQUEST RESPONSES ===');
+
+  // Get all POST responses
+  const postResponses = responses.filter(r => {
+    const matchingRequest = requests.find(req => req.requestId === r.requestId);
+    return matchingRequest && matchingRequest.method === 'POST';
   });
 
-  if (interesting.length === 0) {
-    console.log('(no JSON/text responses found; listing recent responses)');
-    for (const r of responses.slice(-10)) {
-      console.log(`${r.url}  [${r.status}]  mime=${r.mimeType}  body=${r.body ? r.body.toString().slice(0,200) : '<no body>'}`);
-    }
+  if (postResponses.length > 0) {
+    console.log(`Found ${postResponses.length} POST request responses:`);
+
+    postResponses.forEach((r, index) => {
+      const matchingRequest = requests.find(req => req.requestId === r.requestId);
+      const isStreamingResponse = r.isStreaming || r.hasStreamingPackets ||
+        (r.body && typeof r.body === 'string' && (
+          r.body.includes('data: ') ||
+          r.body.includes('data:{') ||
+          r.body.includes('data:[') ||
+          /event:\s*data/i.test(r.body) ||
+          /delta:\s*"/i.test(r.body) ||
+          /content:\s*"/i.test(r.body) ||
+          /chunk/i.test(r.body) ||
+          /token/i.test(r.body) ||
+          /progress/i.test(r.body) ||
+          /finish_reason/i.test(r.body) ||
+          // New streaming format patterns
+          /^f:\{/m.test(r.body) ||
+          /^0:"/m.test(r.body) ||
+          /^e:\{/m.test(r.body) ||
+          /^d:\{/m.test(r.body) ||
+          /"messageId":/i.test(r.body)
+        ));
+
+      console.log(`\n[${index + 1}] POST REQUEST RESPONSE:`);
+      console.log(`URL: ${r.url}`);
+      console.log(`Status: ${r.status}`);
+      console.log(`MIME Type: ${r.mimeType}`);
+      console.log(`Response Complete: ${r.isComplete ? 'YES' : 'NO'}`);
+      console.log(`Is Streaming: ${isStreamingResponse ? 'YES' : 'NO'}`);
+
+      // Display request input/payload
+      if (matchingRequest && matchingRequest.postData) {
+        console.log('\nREQUEST INPUT:');
+        try {
+          // Try to parse and pretty-print JSON
+          const jsonData = JSON.parse(matchingRequest.postData);
+          console.log(JSON.stringify(jsonData, null, 2));
+        } catch {
+          // If not valid JSON, show as-is
+          console.log(matchingRequest.postData.slice(0, 2000) + (matchingRequest.postData.length > 2000 ? '...[truncated]' : ''));
+        }
+      }
+
+      // Show response body
+      if (r.body) {
+        console.log('\nRESPONSE BODY:');
+        if (typeof r.body === 'string') {
+          // For streaming responses, show more content
+          const maxLength = isStreamingResponse ? 5000 : 2000;
+          console.log(r.body.slice(0, maxLength) + (r.body.length > maxLength ? '...[truncated]' : ''));
+        } else {
+          console.log('<binary data>');
+        }
+      } else {
+        console.log('\nRESPONSE BODY: <no body captured>');
+      }
+
+      // Show relevant headers
+      if (r.headers && Object.keys(r.headers).length > 0) {
+        const relevantHeaders = ['content-type', 'transfer-encoding', 'connection', 'content-length'];
+        const filteredHeaders = Object.entries(r.headers)
+          .filter(([key]) => relevantHeaders.includes(key.toLowerCase()))
+          .map(([key, value]) => `${key}: ${value}`)
+          .join('\n');
+
+        if (filteredHeaders) {
+          console.log('\nRELEVANT RESPONSE HEADERS:');
+          console.log(filteredHeaders);
+        }
+      }
+
+      console.log('----------------------------------------');
+    });
   } else {
-    for (const r of interesting.slice(-10)) {
-      console.log('URL:', r.url);
-      console.log('status:', r.status, 'mime:', r.mimeType);
-      console.log('body snippet:', typeof r.body === 'string' ? r.body.slice(0,1000) : '<binary>');
-      console.log('---');
-    }
+    console.log('No POST responses captured.');
   }
 
-  // WebSocket frames
-  if (wsFrames.length) {
-    console.log('\n--- WebSocket frames captured ---');
-    // group frames by requestId
-    const byReq = {};
-    for (const f of wsFrames) {
-      byReq[f.requestId] = byReq[f.requestId] || [];
-      byReq[f.requestId].push(f);
-    }
-    for (const reqId of Object.keys(byReq)) {
-      console.log('WS requestId:', reqId, 'frames:', byReq[reqId].length);
-      const joined = byReq[reqId].map(x => x.payload).join('');
-      const snippet = joined.length > 1500 ? joined.slice(0,1500) + '...[truncated]' : joined;
-      console.log(snippet);
-      console.log('---');
-    }
-  } else {
-    console.log('\n(no WebSocket frames captured)');
+  // Also show streaming summary if any were found
+  const streamingPostResponses = postResponses.filter(r => {
+    const isStreamingResponse = r.isStreaming || r.hasStreamingPackets ||
+      (r.body && typeof r.body === 'string' && (
+        r.body.includes('data: ') ||
+        r.body.includes('data:{') ||
+        r.body.includes('data:[') ||
+        /event:\s*data/i.test(r.body) ||
+        /delta:\s*"/i.test(r.body) ||
+        /content:\s*"/i.test(r.body) ||
+        /chunk/i.test(r.body) ||
+        /token/i.test(r.body) ||
+        /progress/i.test(r.body) ||
+        /finish_reason/i.test(r.body) ||
+        // New streaming format patterns
+        /^f:\{/m.test(r.body) ||
+        /^0:"/m.test(r.body) ||
+        /^e:\{/m.test(r.body) ||
+        /^d:\{/m.test(r.body) ||
+        /"messageId":/i.test(r.body)
+      ));
+    return isStreamingResponse;
+  });
+
+  if (streamingPostResponses.length > 0) {
+    console.log('\n=== STREAMING POST REQUESTS SUMMARY ===');
+    streamingPostResponses.forEach((sr, index) => {
+      const matchingRequest = requests.find(req => req.requestId === sr.requestId);
+      console.log(`[${index + 1}] ${sr.url} [${sr.isComplete ? 'COMPLETE' : 'STREAMING'}]`);
+      if (matchingRequest && matchingRequest.postData) {
+        try {
+          const json = JSON.parse(matchingRequest.postData);
+          const input = json.prompt || json.message || json.messages || json.input || json.query;
+          if (input) {
+            console.log(`    Input: ${JSON.stringify(input).slice(0, 100)}...`);
+          } else {
+            console.log(`    Raw input: ${matchingRequest.postData.slice(0, 100)}...`);
+          }
+        } catch {
+          console.log(`    Raw input: ${matchingRequest.postData.slice(0, 100)}...`);
+        }
+      }
+    });
   }
 
-  // Choose a "final response" heuristic: last interesting response, or last WS payload
-  let final = null;
-  if (interesting.length) {
-    final = interesting[interesting.length - 1];
-    console.log('\n=== Final HTTP response candidate ===');
-    console.log('URL:', final.url);
-    console.log('Body (up to 4000 chars):\n', final.body ? final.body.toString().slice(0,4000) : '<no body>');
-  } else if (wsFrames.length) {
-    const allWs = wsFrames.map(f => f.payload).join('');
-    console.log('\n=== Final WebSocket aggregated payload ===\n', allWs.slice(0,4000));
+  console.log('\n=== SUMMARY: POST REQUESTS WITH STREAMING ===');
+  if (streamingResponses.length > 0) {
+    streamingResponses.forEach((sr, index) => {
+      const status = sr.isComplete ? 'COMPLETE' : 'STREAMING';
+      console.log(`[${index + 1}] ${sr.method} ${sr.url} [${status}]`);
+      if (sr.postData) {
+        try {
+          const json = JSON.parse(sr.postData);
+          const input = json.prompt || json.message || json.messages || json.input || json.query;
+          if (input) {
+            console.log(`    Input: ${JSON.stringify(input).slice(0, 100)}...`);
+          } else {
+            console.log(`    Raw input: ${sr.postData.slice(0, 100)}...`);
+          }
+        } catch {
+          console.log(`    Raw input: ${sr.postData.slice(0, 100)}...`);
+        }
+      }
+    });
   } else {
-    console.log('\nNo clear model response found in captured network traffic within window. Try increasing captureWindowMs or updating selectors for message send.');
+    console.log('No POST requests with streaming responses found.');
   }
 
-  console.log('\nCaptured Request URLs (recent):');
-  for (const r of requests.slice(-20)) {
+  console.log('\nCaptured POST Request URLs:');
+  for (const r of requests.slice(-10)) {
     console.log('-', r.method, r.url);
   }
 
