@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "webscout-mcp": {
+      "command": "node",
+      "args": [
+        "/Users/varungupta/Desktop/varunCrazyProject/ReverseEngineer-MCP/src/index.js"
+      ],
+      "env": {}
+    }
+  }
+}
