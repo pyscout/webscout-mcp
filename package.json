@@ -21,7 +21,7 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pyscout/webscout-mcp.git"
+    "url": "git+https://github.com/pyscout/webscout-mcp.git"
   },
   "homepage": "https://github.com/pyscout/webscout-mcp#readme",
   "engines": {
