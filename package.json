@@ -17,8 +17,16 @@
     "streaming",
     "playwright"
   ],
-  "author": "",
+  "author": "pyscout",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pyscout/webscout-mcp.git"
+  },
+  "homepage": "https://github.com/pyscout/webscout-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.5.0",
     "playwright": "^1.55.1"
