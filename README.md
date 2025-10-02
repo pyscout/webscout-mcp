@@ -66,7 +66,7 @@
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/pyscout/webscout-mcp
 cd webscout-mcp
 
 # Install dependencies
@@ -86,8 +86,8 @@ Add WebScout MCP to your MCP client configuration:
 {
   "mcpServers": {
     "webscout-mcp": {
-      "command": "node",
-      "args": ["/absolute/path/to/webscout-mcp/src/index.js"]
+      "command": "npx",
+      "args": ["-y", "webscout-mcp"]
     }
   }
 }
@@ -243,8 +243,8 @@ Update your MCP client's configuration file:
 {
   "mcpServers": {
     "webscout-mcp": {
-      "command": "node",
-      "args": ["/path/to/webscout-mcp/src/index.js"],
+      "command": "npx",
+      "args": ["-y", "webscout-mcp"],
       "env": {
         "NODE_ENV": "production"
       }
@@ -253,30 +253,21 @@ Update your MCP client's configuration file:
 }
 ```
 
-## 🧪 Testing
+Or for VS Code MCP configuration (`mcp.json`):
 
-Run the comprehensive test suite:
-
-```bash
-# Run all tests
-npm test
-
-# Run specific test suites
-npm run test:utils      # Utility function tests
-npm run test:mcp        # MCP server functionality
-npm run test:interactive # Interactive browser tools
+```json
+{
+  "servers": {
+    "webscout-mcp": {
+      "command": "npx",
+      "args": ["-y", "webscout-mcp"],
+      "type": "stdio"
+    }
+  }
+}
 ```
 
-### Test Coverage
-
-- ✅ MCP protocol compliance
-- ✅ Tool registration and execution
-- ✅ Streaming detection (SSE, chunked, WebSocket)
-- ✅ Data parsing and formatting
-- ✅ Browser automation utilities
-- ✅ Error handling and edge cases
-
-## 🤝 Contributing
+##  Contributing
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature-name`
